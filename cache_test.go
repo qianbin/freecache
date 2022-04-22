@@ -359,7 +359,7 @@ func TestLargeEntry(t *testing.T) {
 		t.Error("value should be nil when get a big key")
 	}
 	key = []byte("abcd")
-	maxValLen := cacheSize/1024 - ENTRY_HDR_SIZE - len(key)
+	maxValLen := cacheSize/1024 - int(ENTRY_HDR_SIZE) - len(key)
 	val = make([]byte, maxValLen+1)
 	err = cache.Set(key, val, 0)
 	if err != ErrLargeEntry {

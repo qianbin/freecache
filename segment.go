@@ -6,7 +6,7 @@ import (
 	"unsafe"
 )
 
-const ENTRY_HDR_SIZE = 32
+const ENTRY_HDR_SIZE = int64(unsafe.Sizeof(entryHdr{}))
 
 var ErrLargeKey = errors.New("The key is larger than 65535")
 var ErrLargeEntry = errors.New("The entry size is larger than 1/1024 of cache size")
@@ -36,15 +36,13 @@ func (p entryPtr) keyLen() uint16 {
 
 // entry header struct in ring buffer, followed by key and value.
 type entryHdr struct {
+	hashVal    uint64
 	accessTime uint32
 	expireAt   uint32
-	keyLen     uint16
-	hashVal    uint64
 	valLen     uint32
 	valCap     uint32
+	keyLen     uint16
 	deleted    bool
-	reserved   uint8
-	pad        uint32
 }
 
 // a segment contains 256 slots, a slot is an array of entry pointers ordered by hash16 value
@@ -85,7 +83,7 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 	if len(key) > 65535 {
 		return ErrLargeKey
 	}
-	maxKeyValLen := len(seg.rb.data)/4 - ENTRY_HDR_SIZE
+	maxKeyValLen := len(seg.rb.data)/4 - int(ENTRY_HDR_SIZE)
 	if len(key)+len(value) > maxKeyValLen {
 		// Do not accept large entry.
 		return ErrLargeEntry
@@ -361,7 +359,8 @@ func (seg *segment) updateEntryPtr(hashVal uint64, oldOff, newOff int64) {
 }
 
 func (seg *segment) insertEntryPtr(hashVal uint64, offset int64, keyLen uint16) {
-	seg.entryMap[hashVal] = entryPtr(makeEntryPtr(offset, keyLen))
+
+	seg.entryMap[hashVal] = makeEntryPtr(offset, keyLen)
 	// // if seg.slotLens[slotId] == seg.slotCap {
 	// // 	seg.expand()
 	// // }
