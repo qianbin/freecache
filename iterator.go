@@ -1,9 +1,5 @@
 package freecache
 
-import (
-	"unsafe"
-)
-
 // Iterator iterates the entries for the cache.
 type Iterator struct {
 	cache      *Cache
@@ -50,24 +46,24 @@ func (it *Iterator) nextForSegment(segIdx int) *Entry {
 }
 
 func (it *Iterator) nextForSlot(seg *segment, slotId int) *Entry {
-	slotOff := int32(it.slotIdx) * seg.slotCap
-	slot := seg.slotsData[slotOff : slotOff+seg.slotLens[it.slotIdx] : slotOff+seg.slotCap]
-	for it.entryIdx < len(slot) {
-		ptr := slot[it.entryIdx]
-		it.entryIdx++
-		now := seg.timer.Now()
-		var hdrBuf [ENTRY_HDR_SIZE]byte
-		seg.rb.ReadAt(hdrBuf[:], ptr.offset)
-		hdr := (*entryHdr)(unsafe.Pointer(&hdrBuf[0]))
-		if hdr.expireAt == 0 || hdr.expireAt > now {
-			entry := new(Entry)
-			entry.Key = make([]byte, hdr.keyLen)
-			entry.Value = make([]byte, hdr.valLen)
-			seg.rb.ReadAt(entry.Key, ptr.offset+ENTRY_HDR_SIZE)
-			seg.rb.ReadAt(entry.Value, ptr.offset+ENTRY_HDR_SIZE+int64(hdr.keyLen))
-			return entry
-		}
-	}
+	// slotOff := int32(it.slotIdx) * seg.slotCap
+	// slot := seg.slotsData[slotOff : slotOff+seg.slotLens[it.slotIdx] : slotOff+seg.slotCap]
+	// for it.entryIdx < len(slot) {
+	// 	ptr := slot[it.entryIdx]
+	// 	it.entryIdx++
+	// 	now := seg.timer.Now()
+	// 	var hdrBuf [ENTRY_HDR_SIZE]byte
+	// 	seg.rb.ReadAt(hdrBuf[:], ptr.offset)
+	// 	hdr := (*entryHdr)(unsafe.Pointer(&hdrBuf[0]))
+	// 	if hdr.expireAt == 0 || hdr.expireAt > now {
+	// 		entry := new(Entry)
+	// 		entry.Key = make([]byte, hdr.keyLen)
+	// 		entry.Value = make([]byte, hdr.valLen)
+	// 		seg.rb.ReadAt(entry.Key, ptr.offset+ENTRY_HDR_SIZE)
+	// 		seg.rb.ReadAt(entry.Value, ptr.offset+ENTRY_HDR_SIZE+int64(hdr.keyLen))
+	// 		return entry
+	// 	}
+	// }
 	return nil
 }
 

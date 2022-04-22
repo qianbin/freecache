@@ -13,7 +13,7 @@ const (
 	segmentCount = 256
 	// segmentAndOpVal is bitwise AND applied to the hashVal to find the segment id.
 	segmentAndOpVal = 255
-	minBufSize      = 512 * 1024
+	minBufSize      = 1024 * 1024
 )
 
 // Cache is a freecache instance.

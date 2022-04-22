@@ -6,32 +6,45 @@ import (
 	"unsafe"
 )
 
-const HASH_ENTRY_SIZE = 16
-const ENTRY_HDR_SIZE = 24
+const ENTRY_HDR_SIZE = 32
 
 var ErrLargeKey = errors.New("The key is larger than 65535")
 var ErrLargeEntry = errors.New("The entry size is larger than 1/1024 of cache size")
 var ErrNotFound = errors.New("Entry not found")
 
 // entry pointer struct points to an entry in ring buffer
-type entryPtr struct {
-	offset   int64  // entry offset in ring buffer
-	hash16   uint16 // entries are ordered by hash16 in a slot.
-	keyLen   uint16 // used to compare a key
-	reserved uint32
+type entryPtr uint64
+
+func makeEntryPtr(offset int64, keyLen uint16) entryPtr {
+	return (entryPtr(offset) << 32) | entryPtr(keyLen)
 }
+
+func (p entryPtr) offset() int64 {
+	return int64(p >> 32)
+}
+
+func (p entryPtr) keyLen() uint16 {
+	return uint16(p)
+}
+
+// type entryPtr struct {
+// 	offset   int64  // entry offset in ring buffer
+// 	hash16   uint16 // entries are ordered by hash16 in a slot.
+// 	keyLen   uint16 // used to compare a key
+// 	reserved uint32
+// }
 
 // entry header struct in ring buffer, followed by key and value.
 type entryHdr struct {
 	accessTime uint32
 	expireAt   uint32
 	keyLen     uint16
-	hash16     uint16
+	hashVal    uint64
 	valLen     uint32
 	valCap     uint32
 	deleted    bool
-	slotId     uint8
-	reserved   uint16
+	reserved   uint8
+	pad        uint32
 }
 
 // a segment contains 256 slots, a slot is an array of entry pointers ordered by hash16 value
@@ -43,17 +56,18 @@ type segment struct {
 	missCount     int64
 	hitCount      int64
 	entryCount    int64
-	totalCount    int64      // number of entries in ring buffer, including deleted entries.
-	totalTime     int64      // used to calculate least recent used entry.
-	timer         Timer      // Timer giving current time
-	totalEvacuate int64      // used for debug
-	totalExpired  int64      // used for debug
-	overwrites    int64      // used for debug
-	touched       int64      // used for debug
-	vacuumLen     int64      // up to vacuumLen, new data can be written without overwriting old data.
-	slotLens      [256]int32 // The actual length for every slot.
-	slotCap       int32      // max number of entry pointers a slot can hold.
-	slotsData     []entryPtr // shared by all 256 slots
+	totalCount    int64 // number of entries in ring buffer, including deleted entries.
+	totalTime     int64 // used to calculate least recent used entry.
+	timer         Timer // Timer giving current time
+	totalEvacuate int64 // used for debug
+	totalExpired  int64 // used for debug
+	overwrites    int64 // used for debug
+	touched       int64 // used for debug
+	vacuumLen     int64 // up to vacuumLen, new data can be written without overwriting old data.
+	// slotLens      [256]int32 // The actual length for every slot.
+	// slotCap       int32      // max number of entry pointers a slot can hold.
+	// slotsData     []entryPtr // shared by all 256 slots
+	entryMap map[uint64]entryPtr
 }
 
 func newSegment(bufSize int, segId int, timer Timer) (seg segment) {
@@ -61,8 +75,9 @@ func newSegment(bufSize int, segId int, timer Timer) (seg segment) {
 	seg.segId = segId
 	seg.timer = timer
 	seg.vacuumLen = int64(bufSize)
-	seg.slotCap = 1
-	seg.slotsData = make([]entryPtr, 256*seg.slotCap)
+	// seg.slotCap = 1
+	seg.entryMap = make(map[uint64]entryPtr)
+	// seg.slotsData = make([]entryPtr, 256*seg.slotCap)
 	return
 }
 
@@ -81,18 +96,14 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 		expireAt = now + uint32(expireSeconds)
 	}
 
-	slotId := uint8(hashVal >> 8)
-	hash16 := uint16(hashVal >> 16)
-	slot := seg.getSlot(slotId)
-	idx, match := seg.lookup(slot, hash16, key)
+	offset, match := seg.lookup(hashVal, key)
 
 	var hdrBuf [ENTRY_HDR_SIZE]byte
 	hdr := (*entryHdr)(unsafe.Pointer(&hdrBuf[0]))
 	if match {
-		matchedPtr := &slot[idx]
-		seg.rb.ReadAt(hdrBuf[:], matchedPtr.offset)
-		hdr.slotId = slotId
-		hdr.hash16 = hash16
+		seg.rb.ReadAt(hdrBuf[:], offset)
+		hdr.hashVal = hashVal
+
 		hdr.keyLen = uint16(len(key))
 		originAccessTime := hdr.accessTime
 		hdr.accessTime = now
@@ -101,13 +112,13 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 		if hdr.valCap >= hdr.valLen {
 			//in place overwrite
 			atomic.AddInt64(&seg.totalTime, int64(hdr.accessTime)-int64(originAccessTime))
-			seg.rb.WriteAt(hdrBuf[:], matchedPtr.offset)
-			seg.rb.WriteAt(value, matchedPtr.offset+ENTRY_HDR_SIZE+int64(hdr.keyLen))
+			seg.rb.WriteAt(hdrBuf[:], offset)
+			seg.rb.WriteAt(value, offset+ENTRY_HDR_SIZE+int64(hdr.keyLen))
 			atomic.AddInt64(&seg.overwrites, 1)
 			return
 		}
 		// avoid unnecessary memory copy.
-		seg.delEntryPtr(slotId, slot, idx)
+		seg.delEntryPtrByOffset(hashVal, offset)
 		match = false
 		// increase capacity and limit entry len.
 		for hdr.valCap < hdr.valLen {
@@ -117,8 +128,7 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 			hdr.valCap = uint32(maxKeyValLen - len(key))
 		}
 	} else {
-		hdr.slotId = slotId
-		hdr.hash16 = hash16
+		hdr.hashVal = hashVal
 		hdr.keyLen = uint16(len(key))
 		hdr.accessTime = now
 		hdr.expireAt = expireAt
@@ -130,16 +140,16 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 	}
 
 	entryLen := ENTRY_HDR_SIZE + int64(len(key)) + int64(hdr.valCap)
-	slotModified := seg.evacuate(entryLen, slotId, now)
+	slotModified := seg.evacuate(entryLen, now)
 	if slotModified {
 		// the slot has been modified during evacuation, we need to looked up for the 'idx' again.
 		// otherwise there would be index out of bound error.
-		slot = seg.getSlot(slotId)
-		idx, match = seg.lookup(slot, hash16, key)
+		// slot = seg.getSlot(slotId)
+		// idx, match = seg.lookup(slot, hash16, key)
 		// assert(match == false)
 	}
 	newOff := seg.rb.End()
-	seg.insertEntryPtr(slotId, hash16, newOff, idx, hdr.keyLen)
+	seg.insertEntryPtr(hashVal, newOff, hdr.keyLen)
 	seg.rb.Write(hdrBuf[:])
 	seg.rb.Write(key)
 	seg.rb.Write(value)
@@ -155,23 +165,19 @@ func (seg *segment) touch(key []byte, hashVal uint64, expireSeconds int) (err er
 		return ErrLargeKey
 	}
 
-	slotId := uint8(hashVal >> 8)
-	hash16 := uint16(hashVal >> 16)
-	slot := seg.getSlot(slotId)
-	idx, match := seg.lookup(slot, hash16, key)
+	offset, match := seg.lookup(hashVal, key)
 	if !match {
 		err = ErrNotFound
 		return
 	}
-	matchedPtr := &slot[idx]
 
 	var hdrBuf [ENTRY_HDR_SIZE]byte
-	seg.rb.ReadAt(hdrBuf[:], matchedPtr.offset)
+	seg.rb.ReadAt(hdrBuf[:], offset)
 	hdr := (*entryHdr)(unsafe.Pointer(&hdrBuf[0]))
 
 	now := seg.timer.Now()
 	if hdr.expireAt != 0 && hdr.expireAt <= now {
-		seg.delEntryPtr(slotId, slot, idx)
+		seg.delEntryPtrByOffset(hashVal, offset)
 		atomic.AddInt64(&seg.totalExpired, 1)
 		err = ErrNotFound
 		atomic.AddInt64(&seg.missCount, 1)
@@ -188,16 +194,16 @@ func (seg *segment) touch(key []byte, hashVal uint64, expireSeconds int) (err er
 	hdr.expireAt = expireAt
 	//in place overwrite
 	atomic.AddInt64(&seg.totalTime, int64(hdr.accessTime)-int64(originAccessTime))
-	seg.rb.WriteAt(hdrBuf[:], matchedPtr.offset)
+	seg.rb.WriteAt(hdrBuf[:], offset)
 	atomic.AddInt64(&seg.touched, 1)
 	return
 }
 
-func (seg *segment) evacuate(entryLen int64, slotId uint8, now uint32) (slotModified bool) {
+func (seg *segment) evacuate(entryLen int64, now uint32) (slotModified bool) {
 	var oldHdrBuf [ENTRY_HDR_SIZE]byte
 	consecutiveEvacuate := 0
 	for seg.vacuumLen < entryLen {
-		oldOff := seg.rb.End() + seg.vacuumLen - seg.rb.Size()
+		oldOff := seg.rb.Begin()
 		seg.rb.ReadAt(oldHdrBuf[:], oldOff)
 		oldHdr := (*entryHdr)(unsafe.Pointer(&oldHdrBuf[0]))
 		oldEntryLen := ENTRY_HDR_SIZE + int64(oldHdr.keyLen) + int64(oldHdr.valCap)
@@ -211,10 +217,8 @@ func (seg *segment) evacuate(entryLen int64, slotId uint8, now uint32) (slotModi
 		expired := oldHdr.expireAt != 0 && oldHdr.expireAt < now
 		leastRecentUsed := int64(oldHdr.accessTime)*atomic.LoadInt64(&seg.totalCount) <= atomic.LoadInt64(&seg.totalTime)
 		if expired || leastRecentUsed || consecutiveEvacuate > 5 {
-			seg.delEntryPtrByOffset(oldHdr.slotId, oldHdr.hash16, oldOff)
-			if oldHdr.slotId == slotId {
-				slotModified = true
-			}
+			seg.delEntryPtrByOffset(oldHdr.hashVal, oldOff)
+
 			consecutiveEvacuate = 0
 			atomic.AddInt64(&seg.totalTime, -int64(oldHdr.accessTime))
 			atomic.AddInt64(&seg.totalCount, -1)
@@ -227,7 +231,7 @@ func (seg *segment) evacuate(entryLen int64, slotId uint8, now uint32) (slotModi
 		} else {
 			// evacuate an old entry that has been accessed recently for better cache hit rate.
 			newOff := seg.rb.Evacuate(oldOff, int(oldEntryLen))
-			seg.updateEntryPtr(oldHdr.slotId, oldHdr.hash16, oldOff, newOff)
+			seg.updateEntryPtr(oldHdr.hashVal, oldOff, newOff)
 			consecutiveEvacuate++
 			atomic.AddInt64(&seg.totalEvacuate, 1)
 		}
@@ -236,7 +240,7 @@ func (seg *segment) evacuate(entryLen int64, slotId uint8, now uint32) (slotModi
 }
 
 func (seg *segment) get(key, buf []byte, hashVal uint64, peek bool) (value []byte, expireAt uint32, err error) {
-	hdr, ptr, err := seg.locate(key, hashVal, peek)
+	hdr, offset, err := seg.locate(key, hashVal, peek)
 	if err != nil {
 		return
 	}
@@ -247,7 +251,7 @@ func (seg *segment) get(key, buf []byte, hashVal uint64, peek bool) (value []byt
 		value = make([]byte, hdr.valLen)
 	}
 
-	seg.rb.ReadAt(value, ptr.offset+ENTRY_HDR_SIZE+int64(hdr.keyLen))
+	seg.rb.ReadAt(value, offset+ENTRY_HDR_SIZE+int64(hdr.keyLen))
 	if !peek {
 		atomic.AddInt64(&seg.hitCount, 1)
 	}
@@ -257,11 +261,11 @@ func (seg *segment) get(key, buf []byte, hashVal uint64, peek bool) (value []byt
 // view provides zero-copy access to the element's value, without copying to
 // an intermediate buffer.
 func (seg *segment) view(key []byte, fn func([]byte) error, hashVal uint64, peek bool) (err error) {
-	hdr, ptr, err := seg.locate(key, hashVal, peek)
+	hdr, offset, err := seg.locate(key, hashVal, peek)
 	if err != nil {
 		return
 	}
-	start := ptr.offset + ENTRY_HDR_SIZE + int64(hdr.keyLen)
+	start := offset + ENTRY_HDR_SIZE + int64(hdr.keyLen)
 	val, err := seg.rb.Slice(start, int64(hdr.valLen))
 	if err != nil {
 		return err
@@ -273,11 +277,9 @@ func (seg *segment) view(key []byte, fn func([]byte) error, hashVal uint64, peek
 	return
 }
 
-func (seg *segment) locate(key []byte, hashVal uint64, peek bool) (hdr *entryHdr, ptr *entryPtr, err error) {
-	slotId := uint8(hashVal >> 8)
-	hash16 := uint16(hashVal >> 16)
-	slot := seg.getSlot(slotId)
-	idx, match := seg.lookup(slot, hash16, key)
+func (seg *segment) locate(key []byte, hashVal uint64, peek bool) (hdr *entryHdr, offset int64, err error) {
+
+	offset, match := seg.lookup(hashVal, key)
 	if !match {
 		err = ErrNotFound
 		if !peek {
@@ -285,15 +287,14 @@ func (seg *segment) locate(key []byte, hashVal uint64, peek bool) (hdr *entryHdr
 		}
 		return
 	}
-	ptr = &slot[idx]
 
 	var hdrBuf [ENTRY_HDR_SIZE]byte
-	seg.rb.ReadAt(hdrBuf[:], ptr.offset)
+	seg.rb.ReadAt(hdrBuf[:], offset)
 	hdr = (*entryHdr)(unsafe.Pointer(&hdrBuf[0]))
 	if !peek {
 		now := seg.timer.Now()
 		if hdr.expireAt != 0 && hdr.expireAt <= now {
-			seg.delEntryPtr(slotId, slot, idx)
+			seg.delEntryPtrByOffset(hashVal, offset)
 			atomic.AddInt64(&seg.totalExpired, 1)
 			err = ErrNotFound
 			atomic.AddInt64(&seg.missCount, 1)
@@ -301,37 +302,33 @@ func (seg *segment) locate(key []byte, hashVal uint64, peek bool) (hdr *entryHdr
 		}
 		atomic.AddInt64(&seg.totalTime, int64(now-hdr.accessTime))
 		hdr.accessTime = now
-		seg.rb.WriteAt(hdrBuf[:], ptr.offset)
+		seg.rb.WriteAt(hdrBuf[:], offset)
 	}
-	return hdr, ptr, err
+	return hdr, offset, err
 }
 
 func (seg *segment) del(key []byte, hashVal uint64) (affected bool) {
-	slotId := uint8(hashVal >> 8)
-	hash16 := uint16(hashVal >> 16)
-	slot := seg.getSlot(slotId)
-	idx, match := seg.lookup(slot, hash16, key)
+
+	offset, match := seg.lookup(hashVal, key)
 	if !match {
 		return false
 	}
-	seg.delEntryPtr(slotId, slot, idx)
+	seg.delEntryPtrByOffset(hashVal, offset)
 	return true
 }
 
 func (seg *segment) ttl(key []byte, hashVal uint64) (timeLeft uint32, err error) {
-	slotId := uint8(hashVal >> 8)
-	hash16 := uint16(hashVal >> 16)
-	slot := seg.getSlot(slotId)
-	idx, match := seg.lookup(slot, hash16, key)
+
+	offset, match := seg.lookup(hashVal, key)
 	if !match {
 		err = ErrNotFound
 		return
 	}
-	ptr := &slot[idx]
+
 	now := seg.timer.Now()
 
 	var hdrBuf [ENTRY_HDR_SIZE]byte
-	seg.rb.ReadAt(hdrBuf[:], ptr.offset)
+	seg.rb.ReadAt(hdrBuf[:], offset)
 	hdr := (*entryHdr)(unsafe.Pointer(&hdrBuf[0]))
 
 	if hdr.expireAt == 0 {
@@ -345,104 +342,93 @@ func (seg *segment) ttl(key []byte, hashVal uint64) (timeLeft uint32, err error)
 	return
 }
 
-func (seg *segment) expand() {
-	newSlotData := make([]entryPtr, seg.slotCap*2*256)
-	for i := 0; i < 256; i++ {
-		off := int32(i) * seg.slotCap
-		copy(newSlotData[off*2:], seg.slotsData[off:off+seg.slotLens[i]])
-	}
-	seg.slotCap *= 2
-	seg.slotsData = newSlotData
-}
+// func (seg *segment) expand() {
+// 	newSlotData := make([]entryPtr, seg.slotCap*2*256)
+// 	for i := 0; i < 256; i++ {
+// 		off := int32(i) * seg.slotCap
+// 		copy(newSlotData[off*2:], seg.slotsData[off:off+seg.slotLens[i]])
+// 	}
+// 	seg.slotCap *= 2
+// 	seg.slotsData = newSlotData
+// }
 
-func (seg *segment) updateEntryPtr(slotId uint8, hash16 uint16, oldOff, newOff int64) {
-	slot := seg.getSlot(slotId)
-	idx, match := seg.lookupByOff(slot, hash16, oldOff)
-	if !match {
+func (seg *segment) updateEntryPtr(hashVal uint64, oldOff, newOff int64) {
+	ptr, ok := seg.getEntryPtr(hashVal)
+	if !ok || ptr.offset() != oldOff {
 		return
 	}
-	ptr := &slot[idx]
-	ptr.offset = newOff
+	seg.entryMap[hashVal] = makeEntryPtr(newOff, ptr.keyLen())
 }
 
-func (seg *segment) insertEntryPtr(slotId uint8, hash16 uint16, offset int64, idx int, keyLen uint16) {
-	if seg.slotLens[slotId] == seg.slotCap {
-		seg.expand()
-	}
-	seg.slotLens[slotId]++
+func (seg *segment) insertEntryPtr(hashVal uint64, offset int64, keyLen uint16) {
+	seg.entryMap[hashVal] = entryPtr(makeEntryPtr(offset, keyLen))
+	// // if seg.slotLens[slotId] == seg.slotCap {
+	// // 	seg.expand()
+	// // }
+	// seg.slotLens[slotId]++
 	atomic.AddInt64(&seg.entryCount, 1)
-	slot := seg.getSlot(slotId)
-	copy(slot[idx+1:], slot[idx:])
-	slot[idx].offset = offset
-	slot[idx].hash16 = hash16
-	slot[idx].keyLen = keyLen
+
+	// slot := seg.getSlot(slotId)
+	// copy(slot[idx+1:], slot[idx:])
+	// slot[idx].offset = offset
+	// slot[idx].hash16 = hash16
+	// slot[idx].keyLen = keyLen
 }
 
-func (seg *segment) delEntryPtrByOffset(slotId uint8, hash16 uint16, offset int64) {
-	slot := seg.getSlot(slotId)
-	idx, match := seg.lookupByOff(slot, hash16, offset)
-	if !match {
+func (seg *segment) delEntryPtrByOffset(hashVal uint64, offset int64) {
+	ptr, ok := seg.getEntryPtr(hashVal)
+	if !ok || ptr.offset() != offset {
 		return
 	}
-	seg.delEntryPtr(slotId, slot, idx)
-}
-
-func (seg *segment) delEntryPtr(slotId uint8, slot []entryPtr, idx int) {
-	offset := slot[idx].offset
 	var entryHdrBuf [ENTRY_HDR_SIZE]byte
 	seg.rb.ReadAt(entryHdrBuf[:], offset)
 	entryHdr := (*entryHdr)(unsafe.Pointer(&entryHdrBuf[0]))
 	entryHdr.deleted = true
 	seg.rb.WriteAt(entryHdrBuf[:], offset)
-	copy(slot[idx:], slot[idx+1:])
-	seg.slotLens[slotId]--
+	//seg.slotLens[slotId]--
 	atomic.AddInt64(&seg.entryCount, -1)
+	delete(seg.entryMap, hashVal)
 }
 
-func entryPtrIdx(slot []entryPtr, hash16 uint16) (idx int) {
-	high := len(slot)
-	for idx < high {
-		mid := (idx + high) >> 1
-		oldEntry := &slot[mid]
-		if oldEntry.hash16 < hash16 {
-			idx = mid + 1
-		} else {
-			high = mid
-		}
-	}
-	return
+func (seg *segment) getEntryPtr(hashVal uint64) (entryPtr, bool) {
+	p, b := seg.entryMap[hashVal]
+	return p, b
 }
 
-func (seg *segment) lookup(slot []entryPtr, hash16 uint16, key []byte) (idx int, match bool) {
-	idx = entryPtrIdx(slot, hash16)
-	for idx < len(slot) {
-		ptr := &slot[idx]
-		if ptr.hash16 != hash16 {
-			break
-		}
-		match = int(ptr.keyLen) == len(key) && seg.rb.EqualAt(key, ptr.offset+ENTRY_HDR_SIZE)
-		if match {
-			return
-		}
-		idx++
-	}
-	return
-}
+// func entryPtrIdx(slot []entryPtr, hash16 uint16) (idx int) {
+// 	high := len(slot)
+// 	for idx < high {
+// 		mid := (idx + high) >> 1
+// 		oldEntry := &slot[mid]
+// 		if oldEntry.hash16 < hash16 {
+// 			idx = mid + 1
+// 		} else {
+// 			high = mid
+// 		}
+// 	}
+// 	return
+// }
 
-func (seg *segment) lookupByOff(slot []entryPtr, hash16 uint16, offset int64) (idx int, match bool) {
-	idx = entryPtrIdx(slot, hash16)
-	for idx < len(slot) {
-		ptr := &slot[idx]
-		if ptr.hash16 != hash16 {
-			break
-		}
-		match = ptr.offset == offset
-		if match {
-			return
-		}
-		idx++
+func (seg *segment) lookup(hashVal uint64, key []byte) (offset int64, match bool) {
+	ptr, ok := seg.getEntryPtr(hashVal)
+	if ok {
+		offset = ptr.offset()
+		match = int(ptr.keyLen()) == len(key) && seg.rb.EqualAt(key, offset+ENTRY_HDR_SIZE)
 	}
 	return
+	// idx = entryPtrIdx(slot, hash16)
+	// for idx < len(slot) {
+	// 	ptr := &slot[idx]
+	// 	if ptr.hash16 != hash16 {
+	// 		break
+	// 	}
+	// 	match = int(ptr.keyLen) == len(key) && seg.rb.EqualAt(key, ptr.offset+ENTRY_HDR_SIZE)
+	// 	if match {
+	// 		return
+	// 	}
+	// 	idx++
+	// }
+	// return
 }
 
 func (seg *segment) resetStatistics() {
@@ -457,11 +443,12 @@ func (seg *segment) clear() {
 	bufSize := len(seg.rb.data)
 	seg.rb.Reset(0)
 	seg.vacuumLen = int64(bufSize)
-	seg.slotCap = 1
-	seg.slotsData = make([]entryPtr, 256*seg.slotCap)
-	for i := 0; i < len(seg.slotLens); i++ {
-		seg.slotLens[i] = 0
-	}
+	// seg.slotCap = 1
+	// seg.slotsData = make([]entryPtr, 256*seg.slotCap)
+	seg.entryMap = make(map[uint64]entryPtr)
+	// for i := 0; i < len(seg.slotLens); i++ {
+	// 	seg.slotLens[i] = 0
+	// }
 
 	atomic.StoreInt64(&seg.hitCount, 0)
 	atomic.StoreInt64(&seg.missCount, 0)
@@ -473,7 +460,7 @@ func (seg *segment) clear() {
 	atomic.StoreInt64(&seg.overwrites, 0)
 }
 
-func (seg *segment) getSlot(slotId uint8) []entryPtr {
-	slotOff := int32(slotId) * seg.slotCap
-	return seg.slotsData[slotOff : slotOff+seg.slotLens[slotId] : slotOff+seg.slotCap]
-}
+// func (seg *segment) getSlot(slotId uint8) []entryPtr {
+// 	slotOff := int32(slotId) * seg.slotCap
+// 	return seg.slotsData[slotOff : slotOff+seg.slotLens[slotId] : slotOff+seg.slotCap]
+// }
