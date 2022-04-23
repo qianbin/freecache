@@ -94,7 +94,16 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 		expireAt = now + uint32(expireSeconds)
 	}
 
-	offset, match := seg.lookup(hashVal, key)
+	var offset int64
+	var match bool
+	// offset, match := seg.lookup(hashVal, key)
+	if ptr, ok := seg.getEntryPtr(hashVal); ok {
+		offset = ptr.offset()
+		match = int(ptr.keyLen()) == len(key) && seg.rb.EqualAt(key, offset+ENTRY_HDR_SIZE)
+		if !match {
+			seg.delEntryPtrByOffset(hashVal, offset)
+		}
+	}
 
 	var hdrBuf [ENTRY_HDR_SIZE]byte
 	hdr := (*entryHdr)(unsafe.Pointer(&hdrBuf[0]))
@@ -201,7 +210,7 @@ func (seg *segment) evacuate(entryLen int64, now uint32) (slotModified bool) {
 	var oldHdrBuf [ENTRY_HDR_SIZE]byte
 	consecutiveEvacuate := 0
 	for seg.vacuumLen < entryLen {
-		oldOff := seg.rb.Begin()
+		oldOff := seg.rb.End() + seg.vacuumLen - seg.rb.Size()
 		seg.rb.ReadAt(oldHdrBuf[:], oldOff)
 		oldHdr := (*entryHdr)(unsafe.Pointer(&oldHdrBuf[0]))
 		oldEntryLen := ENTRY_HDR_SIZE + int64(oldHdr.keyLen) + int64(oldHdr.valCap)
